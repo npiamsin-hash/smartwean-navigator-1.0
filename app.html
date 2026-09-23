@@ -902,10 +902,83 @@
   <div id="researchPageContent" style="max-width:900px;margin:0 auto;padding:16px 14px 60px;"></div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
-/* ---------------- sheet sync config ---------------- */
-const SWN_SHEET_URL="https://script.google.com/macros/s/AKfycbxyR4tWjST97LNr6kNYLU2jmT3cdz5U9HHJqcxKQSdsvIpqfuoEBgXrf-OJdAKcB2RY/exec";
-const SWN_SHEET_SECRET="6077";
+/* ---------------- Supabase config ---------------- */
+// Publishable key is safe to ship in the browser; access is governed by RLS (supabase/schema.sql)
+const SUPABASE_URL="https://jxpcnzajacpkzervuvec.supabase.co";
+const SUPABASE_ANON_KEY="sb_publishable_1BfVK1W0dTp9ZyVNLsgI3Q_VCEJEXij";
+const SWN_TABLE="assessments";
+const sb=window.supabase?window.supabase.createClient(SUPABASE_URL,SUPABASE_ANON_KEY):null;
+
+/* ---------------- Supabase data layer ----------------
+   Each assessment is one row: save_id (PK) + hn/ward/adate (for querying)
+   + data (jsonb, the full flat payload from buildSheetPayload()).
+   Rows are returned flattened, i.e. {save_id, ...data}, oldest first. */
+function dbClient(){
+  if(!sb)throw new Error("โหลด Supabase library ไม่สำเร็จ — เช็คการเชื่อมต่ออินเทอร์เน็ต");
+  return sb;
+}
+function dbRowOut(rec){
+  return{...(rec.data||{}),save_id:rec.save_id,created_at:rec.created_at,updated_at:rec.updated_at};
+}
+function dbIndexCols(data){
+  const col=v=>(v&&v!=="—")?v:null;
+  return{hn:col(data.hn),ward:col(data.ward),adate:col(data.adate)};
+}
+function stampModules(data,prev){
+  const now=new Date().toISOString();
+  [1,2,3].forEach(i=>{
+    const st=data["m"+i+"_status"];
+    if(st&&st!=="idle")data["m"+i+"_updated_at"]=now;
+    else if(prev&&prev["m"+i+"_updated_at"])data["m"+i+"_updated_at"]=prev["m"+i+"_updated_at"];
+  });
+  return data;
+}
+async function dbFetchRows(filter){
+  const PAGE=1000,out=[];
+  for(let from=0;;from+=PAGE){
+    let q=dbClient().from(SWN_TABLE).select("*").order("created_at",{ascending:true}).range(from,from+PAGE-1);
+    if(filter&&filter.hn)q=q.eq("hn",filter.hn);
+    const{data,error}=await q;
+    if(error)throw error;
+    out.push(...data.map(dbRowOut));
+    if(data.length<PAGE)break;
+  }
+  return out;
+}
+async function dbInsert(data){
+  const payload=stampModules({...data});
+  const{error}=await dbClient().from(SWN_TABLE).insert({...dbIndexCols(payload),data:payload});
+  if(error)throw error;
+}
+// Update = merge: modules left idle in the new payload keep their previous
+// values; other fields are overwritten only when the new value is non-empty.
+async function dbUpdateMerge(saveId,data){
+  const{data:rec,error:e1}=await dbClient().from(SWN_TABLE).select("data").eq("save_id",saveId).maybeSingle();
+  if(e1)throw e1;
+  if(!rec)throw new Error("ไม่พบรายการเดิม (save_id "+saveId+")");
+  const prev=rec.data||{},merged={...prev};
+  const idleMods=[1,2,3].filter(i=>(data["m"+i+"_status"]||"idle")==="idle");
+  Object.entries(data).forEach(([k,v])=>{
+    const mod=k.match(/^m([123])_/);
+    if(mod&&idleMods.includes(+mod[1]))return;
+    if(!mod&&(v===""||v===null||v===undefined||v==="—"))return;
+    merged[k]=v;
+  });
+  stampModules(merged,prev);
+  const{error}=await dbClient().from(SWN_TABLE)
+    .update({...dbIndexCols(merged),data:merged,updated_at:new Date().toISOString()})
+    .eq("save_id",saveId);
+  if(error)throw error;
+}
+async function dbDelete(saveId){
+  const{error}=await dbClient().from(SWN_TABLE).delete().eq("save_id",saveId);
+  if(error)throw error;
+}
+function dbErrMsg(err){
+  return(err&&err.message)?err.message:"เชื่อมต่อไม่สำเร็จ — เช็คการตั้งค่า Supabase และการเชื่อมต่ออินเทอร์เน็ต";
+}
 
 /* ---------------- settings (clinical thresholds) ---------------- */
 const DEFAULT_SETTINGS={
@@ -1577,12 +1650,8 @@ async function saveToSheet(){
   let existingMatch=null;
   try{
     if(hn){
-      const resp=await fetch(SWN_SHEET_URL+"?secret="+encodeURIComponent(SWN_SHEET_SECRET));
-      const json=await resp.json();
-      if(json.ok){
-        const matches=(json.rows||[]).filter(r=>String(r.hn||"").trim()===hn);
-        if(matches.length)existingMatch=matches[matches.length-1];
-      }
+      const matches=await dbFetchRows({hn});
+      if(matches.length)existingMatch=matches[matches.length-1];
     }
   }catch(err){ /* lookup failed — fall through and just save as new */ }
   btn.disabled=false;btn.textContent=originalLabel;
@@ -1619,22 +1688,11 @@ async function doSaveToSheet(updateSaveId,repeatNote){
   try{
     const data=buildSheetPayload();
     if(repeatNote)data.repeat_visit_note=repeatNote;
-    // NOTE: Content-Type must stay "text/plain" — Apps Script Web Apps can't
-    // handle a CORS preflight, and "application/json" would trigger one.
-    // The server parses the JSON body manually via JSON.parse(e.postData.contents).
-    const payload=updateSaveId
-      ?{secret:SWN_SHEET_SECRET,action:"update",save_id:updateSaveId,data}
-      :{secret:SWN_SHEET_SECRET,data};
-    const resp=await fetch(SWN_SHEET_URL,{
-      method:"POST",
-      headers:{"Content-Type":"text/plain;charset=utf-8"},
-      body:JSON.stringify(payload)
-    });
-    const json=await resp.json();
-    if(json.ok){showSaveFeedback(true,updateSaveId?"อัพเดตข้อมูลสำเร็จ":"บันทึกข้อมูลสำเร็จ");}
-    else{showSaveFeedback(false,"บันทึกไม่สำเร็จ: "+(json.error||"unauthorized — เช็ครหัสลับ"));}
+    if(updateSaveId)await dbUpdateMerge(updateSaveId,data);
+    else await dbInsert(data);
+    showSaveFeedback(true,updateSaveId?"อัพเดตข้อมูลสำเร็จ":"บันทึกข้อมูลสำเร็จ");
   }catch(err){
-    showSaveFeedback(false,"เชื่อมต่อไม่สำเร็จ — เช็ค Web App URL และการเชื่อมต่ออินเทอร์เน็ต");
+    showSaveFeedback(false,"บันทึกไม่สำเร็จ: "+dbErrMsg(err));
   }finally{
     btn.disabled=false;btn.textContent=originalLabel;
   }
@@ -1859,18 +1917,11 @@ async function loadHistory(){
   const box=document.getElementById("historyPageContent");
   box.innerHTML=`<div class="hist-empty">⏳ กำลังโหลดข้อมูล...</div>`;
   try{
-    const resp=await fetch(SWN_SHEET_URL+"?secret="+encodeURIComponent(SWN_SHEET_SECRET));
-    const json=await resp.json();
-    if(!json.ok){
-      box.innerHTML=`<div class="hist-empty">⚠️ โหลดข้อมูลไม่สำเร็จ: ${json.error||"unauthorized"}<br>
-        <button class="btn btn-ghost" style="margin-top:14px;flex:none;padding:10px 20px" onclick="loadHistory()">ลองใหม่</button></div>`;
-      return;
-    }
-    historyRows=json.rows||[];
+    historyRows=await dbFetchRows();
     historyFilters={q:"",ward:"",from:"",to:""};
     renderHistoryPage();
   }catch(err){
-    box.innerHTML=`<div class="hist-empty">⚠️ เชื่อมต่อไม่สำเร็จ — เช็ค Web App URL และการเชื่อมต่ออินเทอร์เน็ต<br>
+    box.innerHTML=`<div class="hist-empty">⚠️ โหลดข้อมูลไม่สำเร็จ: ${dbErrMsg(err)}<br>
       <button class="btn btn-ghost" style="margin-top:14px;flex:none;padding:10px 20px" onclick="loadHistory()">ลองใหม่</button></div>`;
   }
 }
@@ -2160,40 +2211,27 @@ async function doHnSearch(){
   if(!hn){status.textContent="กรุณากรอก HN";status.style.color="var(--red)";return;}
   status.textContent="⏳ กำลังค้นหา...";status.style.color="var(--muted)";
   try{
-    const resp=await fetch(SWN_SHEET_URL+"?secret="+encodeURIComponent(SWN_SHEET_SECRET));
-    const json=await resp.json();
-    if(!json.ok){status.textContent="ค้นหาไม่สำเร็จ: "+(json.error||"unknown error");status.style.color="var(--red)";return;}
-    historyRows=json.rows||[];
+    historyRows=await dbFetchRows();
     const matches=historyRows.filter(r=>String(r.hn||"").trim()===hn);
     if(!matches.length){status.textContent="ไม่พบข้อมูลผู้ป่วย HN "+hn;status.style.color="var(--red)";return;}
     const latest=matches[matches.length-1];
     document.getElementById("hnSearchSheet")?.remove();
     continueAssessment(latest.save_id);
   }catch(err){
-    status.textContent="เชื่อมต่อไม่สำเร็จ — เช็คอินเทอร์เน็ต";status.style.color="var(--red)";
+    status.textContent="ค้นหาไม่สำเร็จ: "+dbErrMsg(err);status.style.color="var(--red)";
   }
 }
 async function deleteHistoryRecord(saveId){
-  if(!confirm("ยืนยันลบรายการนี้? ข้อมูลจะถูกลบออกจาก Google Sheet ถาวร กู้คืนไม่ได้"))return;
+  if(!confirm("ยืนยันลบรายการนี้? ข้อมูลจะถูกลบออกจากฐานข้อมูลถาวร กู้คืนไม่ได้"))return;
   const btn=document.getElementById("deleteHistBtn");
   const originalLabel=btn.textContent;
   btn.disabled=true;btn.textContent="⏳ กำลังลบ...";
   try{
-    const resp=await fetch(SWN_SHEET_URL,{
-      method:"POST",
-      headers:{"Content-Type":"text/plain;charset=utf-8"},
-      body:JSON.stringify({secret:SWN_SHEET_SECRET,action:"delete",save_id:saveId})
-    });
-    const json=await resp.json();
-    if(json.ok){
-      historyRows=historyRows.filter(r=>r.save_id!==saveId);
-      renderHistoryPage();
-    }else{
-      alert("ลบไม่สำเร็จ: "+(json.error||"unknown error"));
-      btn.disabled=false;btn.textContent=originalLabel;
-    }
+    await dbDelete(saveId);
+    historyRows=historyRows.filter(r=>r.save_id!==saveId);
+    renderHistoryPage();
   }catch(err){
-    alert("เชื่อมต่อไม่สำเร็จ — เช็คอินเทอร์เน็ต");
+    alert("ลบไม่สำเร็จ: "+dbErrMsg(err));
     btn.disabled=false;btn.textContent=originalLabel;
   }
 }
